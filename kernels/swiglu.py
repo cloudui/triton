@@ -25,14 +25,14 @@ def swiglu_pytorch(x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
     - silu(gate) = gate * sigmoid(gate)   [or use torch.nn.functional.silu]
     - output = x * silu(gate)
     """
-    raise NotImplementedError("Implement me first!")
+    return x * (gate * torch.nn.functional.sigmoid(gate))
 
 
 @triton.jit
 def swiglu_kernel(
-    X,        # input pointer
-    Gate,     # gate pointer
-    Output,   # output pointer
+    X,  # input pointer
+    Gate,  # gate pointer
+    Output,  # output pointer
     n_elements,
     BLOCK_SIZE: tl.constexpr,
 ):
@@ -44,6 +44,10 @@ def swiglu_kernel(
     - Load x and gate, compute silu(gate), multiply, store
     """
     pass
+
+
+def swiglu_native(x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+    return x * torch.nn.functional.silu(gate)
 
 
 def swiglu_triton(x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:

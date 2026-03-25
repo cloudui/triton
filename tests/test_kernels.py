@@ -10,7 +10,7 @@ import pytest
 import sys
 sys.path.insert(0, '.')
 from kernels.rmsnorm import rmsnorm_pytorch, rmsnorm_native, rmsnorm_triton
-from kernels.swiglu import swiglu_pytorch, swiglu_triton
+from kernels.swiglu import swiglu_pytorch, swiglu_native, swiglu_triton
 
 
 class TestRMSNorm:
@@ -47,6 +47,11 @@ class TestSwiGLU:
     def test_pytorch_swiglu_shape(self):
         out = swiglu_pytorch(self.x, self.gate)
         assert out.shape == self.x.shape
+
+    def test_pytorch_matches_native(self):
+        ref = swiglu_native(self.x, self.gate)
+        out = swiglu_pytorch(self.x, self.gate)
+        torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
 
     def test_triton_matches_pytorch(self):
         ref = swiglu_pytorch(self.x, self.gate)
