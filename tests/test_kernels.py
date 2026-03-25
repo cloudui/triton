@@ -12,6 +12,8 @@ import torch
 sys.path.insert(0, ".")
 from kernels.rmsnorm import rmsnorm_native, rmsnorm_pytorch, rmsnorm_triton
 from kernels.swiglu import swiglu_native, swiglu_pytorch, swiglu_triton
+from kernels.softmax import softmax_pytorch, softmax_native, softmax_triton
+from kernels.attention import attention_pytorch, attention_native, attention_triton
 
 
 class TestRMSNorm:
@@ -73,4 +75,53 @@ class TestFused:
         normed = rmsnorm_pytorch(self.x, self.weight)
         ref = swiglu_pytorch(normed, self.gate)
         out = fused_rmsnorm_swiglu_triton(self.x, self.gate, self.weight)
+        torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+
+
+class TestSoftmax:
+    def setup_method(self):
+        torch.manual_seed(42)
+        self.x = torch.randn(32, 128, device="cuda", dtype=torch.float16)
+
+    def test_pytorch_softmax_shape(self):
+        out = softmax_pytorch(self.x)
+        assert out.shape == self.x.shape
+
+    def test_pytorch_softmax_sums_to_one(self):
+        out = softmax_pytorch(self.x)
+        row_sums = out.sum(dim=-1)
+        torch.testing.assert_close(row_sums, torch.ones(32, device="cuda", dtype=torch.float16), atol=1e-2, rtol=1e-2)
+
+    def test_pytorch_matches_native(self):
+        ref = softmax_native(self.x)
+        out = softmax_pytorch(self.x)
+        torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+
+    def test_triton_matches_pytorch(self):
+        ref = softmax_pytorch(self.x)
+        out = softmax_triton(self.x)
+        torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+
+
+class TestAttention:
+    def setup_method(self):
+        torch.manual_seed(42)
+        self.seq_len = 64
+        self.d_k = 64
+        self.Q = torch.randn(self.seq_len, self.d_k, device="cuda", dtype=torch.float16)
+        self.K = torch.randn(self.seq_len, self.d_k, device="cuda", dtype=torch.float16)
+        self.V = torch.randn(self.seq_len, self.d_k, device="cuda", dtype=torch.float16)
+
+    def test_pytorch_attention_shape(self):
+        out = attention_pytorch(self.Q, self.K, self.V)
+        assert out.shape == (self.seq_len, self.d_k)
+
+    def test_pytorch_matches_native(self):
+        ref = attention_native(self.Q, self.K, self.V)
+        out = attention_pytorch(self.Q, self.K, self.V)
+        torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+
+    def test_triton_matches_pytorch(self):
+        ref = attention_pytorch(self.Q, self.K, self.V)
+        out = attention_triton(self.Q, self.K, self.V)
         torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
