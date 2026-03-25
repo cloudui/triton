@@ -1,15 +1,10 @@
 """
-SwiGLU Triton Kernel
+SwiGLU — PyTorch reference + Triton kernel
 
 SwiGLU(x, gate) = x * silu(gate)
 where silu(x) = x * sigmoid(x)
 
 Used in Llama, Mistral, etc. as the FFN activation.
-
-Step 1: Implement the PyTorch reference version
-Step 2: Write the Triton kernel
-Step 3: Validate correctness against reference
-Step 4: Benchmark both
 """
 
 import torch
