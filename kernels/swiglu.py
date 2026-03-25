@@ -18,13 +18,6 @@ import triton.language as tl
 
 
 def swiglu_pytorch(x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
-    """
-    Reference PyTorch implementation of SwiGLU.
-
-    TODO: Implement this. It's 1-2 lines.
-    - silu(gate) = gate * sigmoid(gate)   [or use torch.nn.functional.silu]
-    - output = x * silu(gate)
-    """
     return x * (gate * torch.nn.functional.sigmoid(gate))
 
 
@@ -36,14 +29,22 @@ def swiglu_kernel(
     n_elements,
     BLOCK_SIZE: tl.constexpr,
 ):
-    """
-    TODO: Implement the Triton kernel.
+    # get thread id
+    pid = tl.program_id(axis=0)
 
-    This one is simpler than RMSNorm — it's an elementwise operation.
-    - Each program handles a block of elements
-    - Load x and gate, compute silu(gate), multiply, store
-    """
-    pass
+    # get block
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    # item by item mask, swiglu applied to each item individually
+    mask = offsets < n_elements
+
+    x = tl.load(X + offsets, mask=mask)
+    gate = tl.load(Gate + offsets, mask=mask)
+
+    # sigmoid only compiles on fp32
+    output = x * (gate * tl.sigmoid(gate.to(tl.float32)))
+
+    tl.store(Output + offsets, output.to(tl.float16), mask=mask)
 
 
 def swiglu_native(x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
@@ -51,9 +52,16 @@ def swiglu_native(x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
 
 
 def swiglu_triton(x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
-    """
-    Wrapper that launches the Triton kernel.
+    x_flatten = x.view(-1)
+    gate_flatten = gate.view(-1)
+    output = torch.empty_like(x_flatten)
 
-    TODO: Implement after writing the kernel above.
-    """
-    raise NotImplementedError("Implement after writing the kernel!")
+    n_elements = output.numel()
+
+    BLOCK_SIZE = 1024
+
+    grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
+
+    swiglu_kernel[grid](x_flatten, gate_flatten, output, n_elements, BLOCK_SIZE)
+
+    return output.view(x.shape)
