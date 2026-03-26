@@ -6,14 +6,13 @@ Correctness tests — run these before benchmarking.
 
 import sys
 
-import pytest
 import torch
 
 sys.path.insert(0, ".")
+from kernels.attention import attention_native, attention_pytorch, attention_triton
 from kernels.rmsnorm import rmsnorm_native, rmsnorm_pytorch, rmsnorm_triton
+from kernels.softmax import softmax_native, softmax_pytorch, softmax_triton
 from kernels.swiglu import swiglu_native, swiglu_pytorch, swiglu_triton
-from kernels.softmax import softmax_pytorch, softmax_native, softmax_triton
-from kernels.attention import attention_pytorch, attention_native, attention_triton
 
 
 class TestRMSNorm:
@@ -90,7 +89,12 @@ class TestSoftmax:
     def test_pytorch_softmax_sums_to_one(self):
         out = softmax_pytorch(self.x)
         row_sums = out.sum(dim=-1)
-        torch.testing.assert_close(row_sums, torch.ones(32, device="cuda", dtype=torch.float16), atol=1e-2, rtol=1e-2)
+        torch.testing.assert_close(
+            row_sums,
+            torch.ones(32, device="cuda", dtype=torch.float16),
+            atol=1e-2,
+            rtol=1e-2,
+        )
 
     def test_pytorch_matches_native(self):
         ref = softmax_native(self.x)
