@@ -10,6 +10,11 @@ import torch
 
 sys.path.insert(0, ".")
 from kernels.attention import attention_native, attention_pytorch, attention_triton
+from kernels.flash_attention import (
+    flash_attention_naive,
+    flash_attention_pytorch,
+    flash_attention_triton,
+)
 from kernels.rmsnorm import rmsnorm_native, rmsnorm_pytorch, rmsnorm_triton
 from kernels.softmax import softmax_native, softmax_pytorch, softmax_triton
 from kernels.swiglu import swiglu_native, swiglu_pytorch, swiglu_triton
@@ -128,4 +133,38 @@ class TestAttention:
     def test_triton_matches_pytorch(self):
         ref = attention_pytorch(self.Q, self.K, self.V)
         out = attention_triton(self.Q, self.K, self.V)
+        torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+
+
+class TestFlashAttention:
+    def setup_method(self):
+        torch.manual_seed(42)
+        self.seq_len = 256
+        self.d_k = 64
+        self.Q = torch.randn(self.seq_len, self.d_k, device="cuda", dtype=torch.float16)
+        self.K = torch.randn(self.seq_len, self.d_k, device="cuda", dtype=torch.float16)
+        self.V = torch.randn(self.seq_len, self.d_k, device="cuda", dtype=torch.float16)
+
+    def test_pytorch_flash_matches_naive(self):
+        ref = flash_attention_naive(self.Q, self.K, self.V)
+        out = flash_attention_pytorch(self.Q, self.K, self.V)
+        torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+
+    def test_triton_flash_matches_naive(self):
+        ref = flash_attention_naive(self.Q, self.K, self.V)
+        out = flash_attention_triton(self.Q, self.K, self.V)
+        torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+
+    def test_flash_attention_shape(self):
+        out = flash_attention_triton(self.Q, self.K, self.V)
+        assert out.shape == (self.seq_len, self.d_k)
+
+    def test_flash_long_sequence(self):
+        """Test with sequence longer than BLOCK_SEQ to verify tiling works."""
+        seq_len = 1024
+        Q = torch.randn(seq_len, self.d_k, device="cuda", dtype=torch.float16)
+        K = torch.randn(seq_len, self.d_k, device="cuda", dtype=torch.float16)
+        V = torch.randn(seq_len, self.d_k, device="cuda", dtype=torch.float16)
+        ref = flash_attention_naive(Q, K, V)
+        out = flash_attention_triton(Q, K, V)
         torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
