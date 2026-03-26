@@ -26,8 +26,8 @@ def attention_pytorch(
 
 def attention_native(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor) -> torch.Tensor:
     return torch.nn.functional.scaled_dot_product_attention(
-        Q.unsqueeze(0), K.unsqueeze(0), V.unsqueeze(0)
-    ).squeeze(0)
+        Q.unsqueeze(0).unsqueeze(0), K.unsqueeze(0).unsqueeze(0), V.unsqueeze(0).unsqueeze(0)
+    ).squeeze(0).squeeze(0)
 
 
 @triton.jit
