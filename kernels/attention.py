@@ -53,7 +53,7 @@ def attention_kernel(
     row_offsets = tl.arange(0, BLOCK_SEQ)
     col_offsets = tl.arange(0, BLOCK_DK)
 
-    # redundant, strides are the same for this simplifed implementation
+    # strides are the same for this simplified single-head implementation
     offsets_q = pid * stride_q + col_offsets
     offsets_o = pid * stride_o + col_offsets
 

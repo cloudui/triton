@@ -17,8 +17,8 @@ def benchmark():
     sizes = [64, 128, 256, 512]
     d_k = 64
 
-    print(f"{'Seq Len':<12} {'PyTorch (ms)':<15} {'Native (ms)':<15} {'Triton (ms)':<14} {'Speedup'}")
-    print("-" * 65)
+    print(f"{'Seq Len':<12} {'PyTorch (ms)':<15} {'Native (ms)':<15} {'Triton (ms)':<14} {'vs PyTorch':<12} {'vs Native'}")
+    print("-" * 80)
 
     for seq_len in sizes:
         Q = torch.randn(seq_len, d_k, device="cuda", dtype=torch.float16)
@@ -29,9 +29,10 @@ def benchmark():
         ms_native = do_bench(lambda: attention_native(Q, K, V))
         ms_triton = do_bench(lambda: attention_triton(Q, K, V))
 
-        speedup = ms_pytorch / ms_triton
+        speedup_pytorch = ms_pytorch / ms_triton
+        speedup_native = ms_native / ms_triton
 
-        print(f"{seq_len:<12} {ms_pytorch:<15.4f} {ms_native:<15.4f} {ms_triton:<14.4f} {speedup:.2f}x")
+        print(f"{seq_len:<12} {ms_pytorch:<15.4f} {ms_native:<15.4f} {ms_triton:<14.4f} {speedup_pytorch:.2f}x{'':<6} {speedup_native:.2f}x")
 
 
 if __name__ == "__main__":
