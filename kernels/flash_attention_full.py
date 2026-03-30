@@ -61,30 +61,16 @@ def flash_attention_full_kernel(
     BLOCK_DK: tl.constexpr,
 ):
     """
-    TODO: Implement batched multi-head FlashAttention-2 with optional causal masking.
-
-    Grid: (num_q_blocks, batch * n_heads)
-      - pid_q = tl.program_id(0)  → which Q tile
-      - pid_bh = tl.program_id(1) → which batch/head (flattened)
-
-    Steps:
-    1. Compute batch/head offsets from pid_bh
-       - Offset Q, K, V, Output pointers to the right batch/head slice
-    2. Load Q tile — same as v2 kernel
-    3. Loop over K/V tiles — same online softmax
-    4. Causal masking: if IS_CAUSAL, after computing scores, mask positions
-       where key_pos > query_pos with -inf before softmax
-       - query positions: pid_q * BLOCK_Q + tl.arange(0, BLOCK_Q)
-       - key positions: start + tl.arange(0, BLOCK_SEQ)
-       - mask: query_pos[:, None] >= key_pos[None, :]
-       - Also: can skip entire K/V tiles where all keys are in the future
-    5. Store output
+    Batched multi-head FlashAttention-2 with optional causal masking.
+    Each program handles BLOCK_Q query rows for one (batch, head) pair.
     """
     pid_q = tl.program_id(axis=0)
     pid_bh = tl.program_id(axis=1)
 
     batch_idx = pid_bh // n_heads
     head_idx = pid_bh % n_heads
+
+    scale = (1.0 / tl.sqrt(d_k.to(tl.float32))) * 1.44269504
 
     # offset all pointers to the right batch/head slice
     bh_offset = batch_idx * stride_b + head_idx * stride_h
@@ -130,7 +116,7 @@ def flash_attention_full_kernel(
         k_tile = tl.load(K + offsets_2d_i, mask_2d_i)
         v_tile = tl.load(V + offsets_2d_i, mask_2d_i)
 
-        scores = tl.dot(q, tl.trans(k_tile)) / tl.sqrt(d_k.to(tl.float32))
+        scores = tl.dot(q, tl.trans(k_tile)) * scale
 
         if IS_CAUSAL:
             q_positions = q_start + offsets_row
@@ -139,10 +125,11 @@ def flash_attention_full_kernel(
             scores = tl.where(causal_mask, scores, float("-inf"))
 
         m_new = tl.maximum(m, tl.max(scores, axis=-1))
-        correction = tl.exp(m - m_new)
-        scores_exp = tl.exp(scores - m_new[:, None])
+        correction = tl.exp2(m - m_new)
+        scores_exp = tl.exp2(scores - m_new[:, None]).to(tl.float16)
         l_new = l * correction + tl.sum(scores_exp, axis=-1)
-        acc = acc * correction[:, None] + tl.dot(scores_exp, v_tile.to(tl.float32))
+        acc = acc * correction[:, None]
+        acc = tl.dot(scores_exp, v_tile, acc)
 
         m = m_new
         l = l_new
@@ -154,16 +141,7 @@ def flash_attention_full_kernel(
 def flash_attention_full_triton(
     Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, causal: bool = False
 ) -> torch.Tensor:
-    """
-    TODO: Wrapper to launch the kernel.
-
-    Q, K, V: (batch, n_heads, seq_len, d_k)
-
-    Hints:
-    - Use Q.stride() to get (stride_qb, stride_qh, stride_qs, stride_qd)
-    - Grid is 2D: (num_q_blocks, batch * n_heads)
-    - Pass IS_CAUSAL as a constexpr so the compiler can optimize it away
-    """
+    """Wrapper to launch the batched multi-head FlashAttention kernel."""
     n_batch, n_heads, seq_len, d_k = Q.shape
     stride_b, stride_h, stride_s, stride_d = Q.stride()
 
