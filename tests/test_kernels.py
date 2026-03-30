@@ -15,6 +15,11 @@ from kernels.flash_attention import (
     flash_attention_pytorch,
     flash_attention_triton,
 )
+from kernels.flash_attention_full import (
+    flash_attention_full_naive,
+    flash_attention_full_native,
+    flash_attention_full_triton,
+)
 from kernels.rmsnorm import rmsnorm_native, rmsnorm_pytorch, rmsnorm_triton
 from kernels.softmax import softmax_native, softmax_pytorch, softmax_triton
 from kernels.swiglu import swiglu_native, swiglu_pytorch, swiglu_triton
@@ -167,4 +172,49 @@ class TestFlashAttention:
         V = torch.randn(seq_len, self.d_k, device="cuda", dtype=torch.float16)
         ref = flash_attention_naive(Q, K, V)
         out = flash_attention_triton(Q, K, V)
+        torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+
+
+class TestFlashAttentionFull:
+    def setup_method(self):
+        torch.manual_seed(42)
+        self.batch = 2
+        self.n_heads = 4
+        self.seq_len = 256
+        self.d_k = 64
+        self.Q = torch.randn(self.batch, self.n_heads, self.seq_len, self.d_k, device="cuda", dtype=torch.float16)
+        self.K = torch.randn(self.batch, self.n_heads, self.seq_len, self.d_k, device="cuda", dtype=torch.float16)
+        self.V = torch.randn(self.batch, self.n_heads, self.seq_len, self.d_k, device="cuda", dtype=torch.float16)
+
+    def test_non_causal_matches_naive(self):
+        ref = flash_attention_full_naive(self.Q, self.K, self.V, causal=False)
+        out = flash_attention_full_triton(self.Q, self.K, self.V, causal=False)
+        torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+
+    def test_causal_matches_naive(self):
+        ref = flash_attention_full_naive(self.Q, self.K, self.V, causal=True)
+        out = flash_attention_full_triton(self.Q, self.K, self.V, causal=True)
+        torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+
+    def test_matches_native_non_causal(self):
+        ref = flash_attention_full_native(self.Q, self.K, self.V, causal=False)
+        out = flash_attention_full_triton(self.Q, self.K, self.V, causal=False)
+        torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+
+    def test_matches_native_causal(self):
+        ref = flash_attention_full_native(self.Q, self.K, self.V, causal=True)
+        out = flash_attention_full_triton(self.Q, self.K, self.V, causal=True)
+        torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+
+    def test_output_shape(self):
+        out = flash_attention_full_triton(self.Q, self.K, self.V, causal=False)
+        assert out.shape == (self.batch, self.n_heads, self.seq_len, self.d_k)
+
+    def test_long_sequence_causal(self):
+        seq_len = 1024
+        Q = torch.randn(1, 2, seq_len, self.d_k, device="cuda", dtype=torch.float16)
+        K = torch.randn(1, 2, seq_len, self.d_k, device="cuda", dtype=torch.float16)
+        V = torch.randn(1, 2, seq_len, self.d_k, device="cuda", dtype=torch.float16)
+        ref = flash_attention_full_naive(Q, K, V, causal=True)
+        out = flash_attention_full_triton(Q, K, V, causal=True)
         torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
