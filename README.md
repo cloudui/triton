@@ -1,6 +1,6 @@
 # Triton GPU Kernels
 
-Custom Triton kernels for core transformer operations — from elementwise activations to FlashAttention — with PyTorch reference implementations and benchmarks. Built from scratch to understand GPU kernel programming and memory-aware algorithm design.
+Custom Triton kernels for core transformer operations — from elementwise activations to a full FlashAttention-2 implementation — with PyTorch reference implementations and benchmarks. Built from scratch to understand GPU kernel programming, memory-aware algorithm design, and tensor core utilization.
 
 ## Kernels
 
@@ -19,8 +19,8 @@ Numerically stable softmax with row-wise max subtraction for fp16 precision. **4
 ### Naive Attention
 Single-head scaled dot-product attention: `softmax(Q @ K^T / sqrt(d_k)) @ V`. All three operations fused into one kernel. Only works for short sequences (must fit in one block). **1.9-2.3x faster than PyTorch, 1.2-1.6x faster than native.**
 
-### FlashAttention-2
-Tiled attention with online softmax — processes K/V in tiles so the full `(seq_len, seq_len)` attention matrix is never materialized. Uses `tl.dot` for tensor core acceleration. O(N) memory instead of O(N²). **2.75x faster than naive PyTorch at seq_len=32K, within 2x of PyTorch's production FlashAttention.**
+### FlashAttention-2 (Full)
+Batched multi-head FlashAttention-2 with optional causal masking. Tiled attention with online softmax, `tl.dot` for tensor core acceleration, causal early exit optimization, and `exp2` hardware intrinsics. O(N) memory instead of O(N²). **Achieves 84-115% of PyTorch's production FlashAttention (Tri Dao's CUDA implementation) on A100.**
 
 ## Benchmarks
 
@@ -78,22 +78,31 @@ Seq Len      PyTorch (ms)    Native (ms)     Triton (ms)    vs PyTorch   vs Nati
 512          0.0254          0.0168          0.0118         2.15x       1.42x
 ```
 
-### FlashAttention-2 (single-head, d_k=64)
+### FlashAttention-2 — Non-Causal (batch=4, heads=8, d_k=64)
 ```
-Seq Len    Naive (ms)     Flash (ms)     Native (ms)    Flash vs Naive   Flash vs Native  Naive mem (MB)
-----------------------------------------------------------------------------------------------------
-128        0.0220         0.0127         0.0116         1.73x            0.92x            0.0
-256        0.0207         0.0152         0.0154         1.36x            1.01x            0.1
-512        0.0257         0.0231         0.0170         1.11x            0.73x            0.5
-1024       0.0319         0.0379         0.0182         0.84x            0.48x            2.0
-2048       0.0724         0.0675         0.0263         1.07x            0.39x            8.0
-4096       0.2066         0.1269         0.0474         1.63x            0.37x            32.0
-8192       0.6698         0.3536         0.1271         1.89x            0.36x            128.0
-16384      2.4386         1.1322         0.6317         2.15x            0.56x            512.0
-32768      9.8582         3.5854         1.9910         2.75x            0.56x            2048.0
+Seq Len    Naive (ms)     Flash (ms)     Native (ms)    Flash vs Naive   Flash vs Native
+--------------------------------------------------------------------------------
+128        0.0788         0.0124         0.0130         6.34x            1.04x
+256        0.0755         0.0155         0.0170         4.88x            1.10x
+512        0.0866         0.0285         0.0311         3.04x            1.09x
+1024       0.3437         0.0695         0.0740         4.94x            1.06x
+2048       1.7805         0.2482         0.2172         7.17x            0.88x
+4096       5.6174         0.9358         0.8457         6.00x            0.90x
 ```
 
-Native uses PyTorch's built-in `scaled_dot_product_attention` (Tri Dao's production FlashAttention). Our Triton implementation achieves ~55% of production performance — the gap is due to warp-level optimizations, software pipelining, and autotuning in the production kernel.
+### FlashAttention-2 — Causal (batch=4, heads=8, d_k=64)
+```
+Seq Len    Naive (ms)     Flash (ms)     Native (ms)    Flash vs Naive   Flash vs Native
+--------------------------------------------------------------------------------
+128        0.2040         0.0110         0.0126         18.56x           1.15x
+256        0.1470         0.0168         0.0179         8.74x            1.07x
+512        0.1489         0.0306         0.0337         4.87x            1.10x
+1024       0.6240         0.0604         0.0608         10.33x           1.01x
+2048       3.1640         0.1730         0.1555         18.29x           0.90x
+4096       10.3571        0.5845         0.4911         17.72x           0.84x
+```
+
+Native uses PyTorch's built-in `scaled_dot_product_attention` (Tri Dao's production FlashAttention CUDA implementation). Our Triton implementation achieves 84-115% of production performance at small-to-medium sequence lengths, narrowing to ~84% at seq_len=4096 where production-level warp scheduling and memory pipelining optimizations have more impact.
 
 ## Project Structure
 
@@ -103,14 +112,16 @@ kernels/
   swiglu.py                   # SwiGLU: gated FFN activation
   softmax.py                  # Softmax: numerically stable row normalization
   attention.py                # Naive attention: fused scaled dot-product
-  flash_attention.py          # FlashAttention-2: tiled attention with online softmax
+  flash_attention.py          # FlashAttention-2: single-head, tiled with online softmax
+  flash_attention_full.py     # FlashAttention-2: batched, multi-head, causal
   fused_rmsnorm_swiglu.py     # Fused RMSNorm + SwiGLU into one kernel
 benchmarks/
   bench_rmsnorm.py            # RMSNorm performance
   bench_swiglu.py             # SwiGLU performance
   bench_softmax.py            # Softmax performance
   bench_attention.py          # Naive attention performance (small seqs)
-  bench_flash_attention.py    # FlashAttention vs naive vs native
+  bench_flash_attention.py    # FlashAttention single-head vs naive vs native
+  bench_flash_attention_full.py  # FlashAttention batched/multi-head/causal
   bench_fused.py              # Fused kernel vs PyTorch vs torch.compile
 tests/
   test_kernels.py             # Correctness tests for all kernels
@@ -131,6 +142,7 @@ python benchmarks/bench_swiglu.py
 python benchmarks/bench_softmax.py
 python benchmarks/bench_attention.py
 python benchmarks/bench_flash_attention.py
+python benchmarks/bench_flash_attention_full.py
 python benchmarks/bench_fused.py
 ```
 
@@ -143,11 +155,12 @@ This repo represents a progression through Triton kernel development:
 3. **Fused RMSNorm+SwiGLU** — Kernel fusion. Learn why combining ops saves HBM bandwidth.
 4. **Softmax** — Numerically stable reduction. Learn the max-subtract trick for fp16.
 5. **Naive Attention** — 2D block loads. Learn broadcasting and multi-dimensional indexing.
-6. **FlashAttention-2** — Tiled attention with online softmax. Learn looping within kernels, `tl.dot` for tensor cores, and incremental algorithms that avoid materializing large intermediates.
+6. **FlashAttention-2 (single-head)** — Tiled attention with online softmax. Learn looping within kernels and incremental algorithms.
+7. **FlashAttention-2 (full)** — Batched multi-head with causal masking. Learn 2D grids, stride-based pointer arithmetic, tensor core utilization via `tl.dot`, and causal early exit optimization.
 
 ## Requirements
 
 - Python 3.10+
 - PyTorch 2.0+ (with CUDA)
 - Triton 2.0+
-- NVIDIA GPU
+- NVIDIA GPU (benchmarked on A100 80GB)
