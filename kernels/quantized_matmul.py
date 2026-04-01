@@ -242,7 +242,7 @@ def matmul_int8_triton(
     stride_wk, stride_wn = W_int8.stride()
     stride_om, stride_on = output.stride()
 
-    BLOCK_M, BLOCK_K, BLOCK_N = 64, 32, 64
+    BLOCK_M, BLOCK_K, BLOCK_N = 64, 64, 64
     grid = (M // BLOCK_M, N // BLOCK_N)
 
     matmul_int8_kernel[grid](
@@ -292,12 +292,8 @@ def matmul_int4_kernel(
     BLOCK_K: tl.constexpr,
 ):
     """
-    TODO: Implement int4 dequantized matmul (after int8 works).
-
-    Same structure as int8 but:
-    - W_packed has two int4 values per byte — need bit manipulation to unpack
-    - Scales and zeros are per-group, not per-column
-    - Unpack: lo = W_packed & 0xF, hi = (W_packed >> 4) & 0xF
+    Int4 dequantized matmul with bit unpacking and group-wise scale/zero_point.
+    Unpacks two int4 values per byte, dequantizes to fp16, then uses tl.dot.
     """
     assert GROUP_SIZE >= BLOCK_K
 
@@ -373,7 +369,7 @@ def matmul_int4_triton(
     stride_om, stride_on = output.stride()
     stride_sk, stride_sn = scales.stride()
 
-    BLOCK_M, BLOCK_K, BLOCK_N = 64, 32, 64
+    BLOCK_M, BLOCK_K, BLOCK_N = 64, 64, 64
     grid = (M // BLOCK_M, N // BLOCK_N)
 
     matmul_int4_kernel[grid](
