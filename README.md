@@ -1,6 +1,6 @@
 # Triton GPU Kernels
 
-Custom Triton kernels for core transformer operations — from elementwise activations to a full FlashAttention-2 implementation — with PyTorch reference implementations and benchmarks. Built from scratch to understand GPU kernel programming, memory-aware algorithm design, and tensor core utilization.
+Custom Triton kernels for core transformer operations — from elementwise activations to FlashAttention-2 and quantized matmul — with PyTorch reference implementations and benchmarks. Built from scratch to understand GPU kernel programming, memory-aware algorithm design, and tensor core utilization.
 
 ## Kernels
 
@@ -21,6 +21,9 @@ Single-head scaled dot-product attention: `softmax(Q @ K^T / sqrt(d_k)) @ V`. Al
 
 ### FlashAttention-2 (Full)
 Batched multi-head FlashAttention-2 with optional causal masking. Tiled attention with online softmax, `tl.dot` for tensor core acceleration, causal early exit optimization, and `exp2` hardware intrinsics. O(N) memory instead of O(N²). **Achieves 84-115% of PyTorch's production FlashAttention (Tri Dao's CUDA implementation) on A100.**
+
+### Quantized Matmul (int8 / int4)
+Tiled matmul kernels that load quantized weights (int8 or int4) and dequantize on the fly to fp16 for tensor core computation. Int4 kernel handles bit-packed weights (two values per byte) with group-wise scale/zero_point. **2x / 3.8x weight memory savings.** Demonstrates the tiled matmul programming pattern (2D grid + K-loop accumulation) and quantization fundamentals.
 
 ## Benchmarks
 
@@ -102,7 +105,20 @@ Seq Len    Naive (ms)     Flash (ms)     Native (ms)    Flash vs Naive   Flash v
 4096       10.3571        0.5845         0.4911         17.72x           0.84x
 ```
 
-Native uses PyTorch's built-in `scaled_dot_product_attention` (Tri Dao's production FlashAttention CUDA implementation). Our Triton implementation achieves 84-115% of production performance at small-to-medium sequence lengths, narrowing to ~84% at seq_len=4096 where production-level warp scheduling and memory pipelining optimizations have more impact.
+Native uses PyTorch's built-in `scaled_dot_product_attention` (Tri Dao's production FlashAttention CUDA implementation). Our Triton implementation achieves 84-115% of production performance at small-to-medium sequence lengths, narrowing to ~84% at seq_len=4096.
+
+### Quantized Matmul (M=128)
+```
+K×N            fp16 (ms)    int8 TT (ms)   int4 TT (ms)   int8 vs fp16   int4 vs fp16   int8 mem    int4 mem
+--------------------------------------------------------------------------------------------------------------
+1024×1024      0.014        0.019          0.029          0.73x          0.48x          2.0x less   3.8x less
+2048×2048      0.019        0.031          0.053          0.63x          0.36x          2.0x less   3.8x less
+4096×4096      0.048        0.071          0.104          0.68x          0.47x          2.0x less   3.8x less
+4096×11008     0.111        0.154          0.134          0.72x          0.83x          2.0x less   3.8x less
+8192×8192      0.123        0.195          0.233          0.63x          0.53x          2.0x less   3.8x less
+```
+
+Quantized kernels are slower than cuBLAS fp16 because dequantization happens per-tile in fp16 before `tl.dot`. Production systems use integer tensor core instructions (int8×int8→int32) or FP8 tensor cores (H100+) to avoid this overhead. The value of quantization is memory savings (fitting larger models on fewer GPUs), not latency on individual matmuls.
 
 ## Project Structure
 
@@ -115,6 +131,7 @@ kernels/
   flash_attention.py          # FlashAttention-2: single-head, tiled with online softmax
   flash_attention_full.py     # FlashAttention-2: batched, multi-head, causal
   fused_rmsnorm_swiglu.py     # Fused RMSNorm + SwiGLU into one kernel
+  quantized_matmul.py         # int8/int4 quantized matmul with dequantize-on-the-fly
 benchmarks/
   bench_rmsnorm.py            # RMSNorm performance
   bench_swiglu.py             # SwiGLU performance
@@ -123,6 +140,7 @@ benchmarks/
   bench_flash_attention.py    # FlashAttention single-head vs naive vs native
   bench_flash_attention_full.py  # FlashAttention batched/multi-head/causal
   bench_fused.py              # Fused kernel vs PyTorch vs torch.compile
+  bench_quantized_matmul.py   # Quantized matmul latency + memory savings
 tests/
   test_kernels.py             # Correctness tests for all kernels
 ```
@@ -144,6 +162,7 @@ python benchmarks/bench_attention.py
 python benchmarks/bench_flash_attention.py
 python benchmarks/bench_flash_attention_full.py
 python benchmarks/bench_fused.py
+python benchmarks/bench_quantized_matmul.py
 ```
 
 ## Learning Path
@@ -156,7 +175,42 @@ This repo represents a progression through Triton kernel development:
 4. **Softmax** — Numerically stable reduction. Learn the max-subtract trick for fp16.
 5. **Naive Attention** — 2D block loads. Learn broadcasting and multi-dimensional indexing.
 6. **FlashAttention-2 (single-head)** — Tiled attention with online softmax. Learn looping within kernels and incremental algorithms.
-7. **FlashAttention-2 (full)** — Batched multi-head with causal masking. Learn 2D grids, stride-based pointer arithmetic, tensor core utilization via `tl.dot`, and causal early exit optimization.
+7. **FlashAttention-2 (full)** — Batched multi-head with causal masking. Learn 2D grids, stride-based pointer arithmetic, tensor core utilization via `tl.dot`, and causal early exit.
+8. **Quantized Matmul** — int8/int4 dequantize-on-the-fly. Learn tiled matmul (2D grid + K-loop), bit packing/unpacking, group quantization, and the tradeoffs between memory savings and compute overhead.
+
+## Testing Quantized Matmul
+
+The quantization tests are split into four classes, separating concerns so failures are isolated:
+
+- **`TestInt8Quantization` / `TestInt4Quantization`** — test the quantize/dequantize utilities with no Triton dependency. If the kernel crashes, these still run.
+- **`TestInt8Matmul` / `TestInt4Matmul`** — test matmul correctness (PyTorch reference vs fp16 baseline, Triton vs PyTorch reference).
+
+All tests are parametrized over multiple matrix sizes to catch dimension-dependent bugs.
+
+### Error bounds
+
+Tolerances are derived from quantization theory, not guesswork:
+
+**Roundtrip error** (quantize → dequantize): each value is rounded to the nearest integer bin, so max per-element error = `scale / 2`. For `randn` weights with range ≈ 6:
+- int8: `scale = 6/255 ≈ 0.024`, mean error ≈ `scale/4 ≈ 0.006`, max ≈ `scale/2 ≈ 0.012`
+- int4: `scale = 6/15 ≈ 0.4`, mean error ≈ `0.1`, max ≈ `0.2`
+
+**Matmul error** (quantized vs fp16): quantization error accumulates over the K-dimension dot product. Each output element sums K independent error terms, so the standard deviation grows as `scale * sqrt(K/12)`:
+- int8, K=256: `std ≈ 0.024 * sqrt(256/12) ≈ 0.11`
+- int4, K=256: `std ≈ 0.4 * sqrt(256/12) ≈ 1.85`
+
+**Triton vs PyTorch** (same math, different execution): tight tolerance (`atol=0.1`) since the only difference is floating point accumulation order on GPU vs CPU.
+
+### What else the tests check
+- Quantized weight dtypes and value ranges (int8 in [-128, 127], int4 nibbles in [0, 15])
+- Scale is positive for every column
+- Memory savings are exact (int8 = 2x, int4 packed = 4x vs fp16 weight bytes)
+- Output shapes match expected (M, N)
+
+Run just the quantization utility tests (no Triton needed):
+```bash
+pytest tests/test_kernels.py -k "Quantization" -v
+```
 
 ## Requirements
 
