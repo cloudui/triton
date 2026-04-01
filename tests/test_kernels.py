@@ -23,6 +23,10 @@ from kernels.flash_attention_full import (
 from kernels.rmsnorm import rmsnorm_native, rmsnorm_pytorch, rmsnorm_triton
 from kernels.softmax import softmax_native, softmax_pytorch, softmax_triton
 from kernels.swiglu import swiglu_native, swiglu_pytorch, swiglu_triton
+from kernels.quantized_matmul import (
+    quantize_int8, dequantize_int8, matmul_fp16, matmul_int8_pytorch, matmul_int8_triton,
+    quantize_int4, dequantize_int4, matmul_int4_pytorch, matmul_int4_triton,
+)
 
 
 class TestRMSNorm:
@@ -218,3 +222,196 @@ class TestFlashAttentionFull:
         ref = flash_attention_full_naive(Q, K, V, causal=True)
         out = flash_attention_full_triton(Q, K, V, causal=True)
         torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+
+
+import pytest
+
+# Sizes must be divisible by block sizes: BLOCK_M=64, BLOCK_K=32, BLOCK_N=64
+INT8_SIZES = [(64, 32, 64), (128, 256, 512), (256, 128, 128)]
+# Int4 additionally needs K % group_size == 0
+INT4_SIZES = [(64, 128, 64), (128, 256, 512), (128, 256, 128)]
+
+
+def _make_int8_data(M, K, N):
+    torch.manual_seed(42)
+    x = torch.randn(M, K, device="cuda", dtype=torch.float16)
+    W = torch.randn(K, N, device="cuda", dtype=torch.float16)
+    W_int8, scale, zero_point = quantize_int8(W)
+    return x, W, W_int8, scale, zero_point
+
+
+def _make_int4_data(M, K, N, group_size=128):
+    torch.manual_seed(42)
+    x = torch.randn(M, K, device="cuda", dtype=torch.float16)
+    W = torch.randn(K, N, device="cuda", dtype=torch.float16)
+    W_packed, scales, zeros = quantize_int4(W, group_size)
+    return x, W, W_packed, scales, zeros
+
+
+# ── int8 quantization ──────────────────────────────────────────
+
+
+class TestInt8Quantization:
+    """Tests for quantize/dequantize utilities — no Triton needed."""
+
+    @pytest.mark.parametrize("M,K,N", INT8_SIZES)
+    def test_shapes(self, M, K, N):
+        _, W, W_int8, scale, zero_point = _make_int8_data(M, K, N)
+        assert W_int8.shape == (K, N)
+        assert scale.shape == (N,)
+        assert zero_point.shape == (N,)
+
+    @pytest.mark.parametrize("M,K,N", INT8_SIZES)
+    def test_dtypes(self, M, K, N):
+        _, W, W_int8, scale, zero_point = _make_int8_data(M, K, N)
+        assert W_int8.dtype in (torch.int8, torch.uint8)
+        assert scale.dtype == torch.float16
+
+    @pytest.mark.parametrize("M,K,N", INT8_SIZES)
+    def test_values_in_range(self, M, K, N):
+        _, _, W_int8, _, _ = _make_int8_data(M, K, N)
+        if W_int8.dtype == torch.uint8:
+            assert W_int8.min() >= 0 and W_int8.max() <= 255
+        else:
+            assert W_int8.min() >= -128 and W_int8.max() <= 127
+
+    @pytest.mark.parametrize("M,K,N", INT8_SIZES)
+    def test_scale_positive(self, M, K, N):
+        _, _, _, scale, _ = _make_int8_data(M, K, N)
+        assert (scale > 0).all(), "scale must be positive for every column"
+
+    @pytest.mark.parametrize("M,K,N", INT8_SIZES)
+    def test_roundtrip_error(self, M, K, N):
+        """Quantize → dequantize should recover weights within ~1 quantization step."""
+        _, W, W_int8, scale, zero_point = _make_int8_data(M, K, N)
+        W_deq = dequantize_int8(W_int8, scale, zero_point).half()
+        mean_err = (W_deq - W).abs().mean().item()
+        max_err = (W_deq - W).abs().max().item()
+        # Mean error should be well under one quantization step
+        assert mean_err < 0.02, f"mean roundtrip error {mean_err:.4f} exceeds 0.02"
+        # Max error should be at most ~1 step (scale ≈ range/255 ≈ 0.024 for randn)
+        assert max_err < 0.1, f"max roundtrip error {max_err:.4f} exceeds 0.1"
+
+    @pytest.mark.parametrize("M,K,N", INT8_SIZES)
+    def test_memory_savings(self, M, K, N):
+        """int8 weights should use exactly half the memory of fp16."""
+        _, W, W_int8, _, _ = _make_int8_data(M, K, N)
+        fp16_bytes = W.nelement() * W.element_size()
+        int8_bytes = W_int8.nelement() * W_int8.element_size()
+        assert int8_bytes == fp16_bytes // 2
+
+
+# ── int8 matmul ─────────────────────────────────────────────────
+
+
+class TestInt8Matmul:
+    """Matmul correctness — PyTorch reference and Triton kernel."""
+
+    @pytest.mark.parametrize("M,K,N", INT8_SIZES)
+    def test_pytorch_vs_fp16(self, M, K, N):
+        """PyTorch dequantized matmul should approximate full-precision matmul."""
+        x, W, W_int8, scale, zero_point = _make_int8_data(M, K, N)
+        ref = matmul_fp16(x, W).float()
+        out = matmul_int8_pytorch(x, W_int8, scale, zero_point)
+        # Error accumulates over K: expect ~sqrt(K) * quant_step per element
+        torch.testing.assert_close(out, ref, atol=1.0, rtol=0.05)
+
+    @pytest.mark.parametrize("M,K,N", INT8_SIZES)
+    def test_triton_vs_pytorch(self, M, K, N):
+        """Triton should match PyTorch exactly (same math, different execution)."""
+        x, _, W_int8, scale, zero_point = _make_int8_data(M, K, N)
+        ref = matmul_int8_pytorch(x, W_int8, scale, zero_point)
+        out = matmul_int8_triton(x, W_int8, scale, zero_point)
+        torch.testing.assert_close(out.float(), ref, atol=0.1, rtol=1e-2)
+
+    @pytest.mark.parametrize("M,K,N", INT8_SIZES)
+    def test_output_shape(self, M, K, N):
+        x, _, W_int8, scale, zero_point = _make_int8_data(M, K, N)
+        out = matmul_int8_triton(x, W_int8, scale, zero_point)
+        assert out.shape == (M, N)
+
+
+# ── int4 quantization ──────────────────────────────────────────
+
+
+class TestInt4Quantization:
+    """Tests for int4 quantize/dequantize utilities — no Triton needed."""
+
+    @pytest.mark.parametrize("M,K,N", INT4_SIZES)
+    def test_shapes(self, M, K, N):
+        group_size = 128
+        _, W, W_packed, scales, zeros = _make_int4_data(M, K, N, group_size)
+        assert W_packed.shape == (K, N // 2), "two int4 values packed per byte along N"
+        num_groups = K // group_size
+        assert scales.shape == (num_groups, N)
+        assert zeros.shape == (num_groups, N)
+
+    @pytest.mark.parametrize("M,K,N", INT4_SIZES)
+    def test_dtypes(self, M, K, N):
+        _, _, W_packed, scales, zeros = _make_int4_data(M, K, N)
+        assert W_packed.dtype == torch.uint8, "packed int4 pairs stored as uint8"
+        assert scales.dtype == torch.float16
+        assert zeros.dtype == torch.float16
+
+    @pytest.mark.parametrize("M,K,N", INT4_SIZES)
+    def test_packed_nibbles_in_range(self, M, K, N):
+        """Each nibble (4-bit value) should be in [0, 15]."""
+        _, _, W_packed, _, _ = _make_int4_data(M, K, N)
+        lo = W_packed & 0xF
+        hi = (W_packed >> 4) & 0xF
+        assert lo.max() <= 15 and lo.min() >= 0
+        assert hi.max() <= 15 and hi.min() >= 0
+
+    @pytest.mark.parametrize("M,K,N", INT4_SIZES)
+    def test_roundtrip_error(self, M, K, N):
+        """int4 has only 16 bins — expect larger error than int8."""
+        group_size = 128
+        _, W, W_packed, scales, zeros = _make_int4_data(M, K, N, group_size)
+        W_deq = dequantize_int4(W_packed, scales, zeros, group_size).half()
+        mean_err = (W_deq - W).abs().mean().item()
+        max_err = (W_deq - W).abs().max().item()
+        # 16 bins over randn range → step ≈ range/15 ≈ 0.4, mean err ≈ step/4
+        assert mean_err < 0.15, f"mean roundtrip error {mean_err:.4f} exceeds 0.15"
+        assert max_err < 0.5, f"max roundtrip error {max_err:.4f} exceeds 0.5"
+
+    @pytest.mark.parametrize("M,K,N", INT4_SIZES)
+    def test_memory_savings(self, M, K, N):
+        """int4 packed weights should use 1/4 the memory of fp16."""
+        _, W, W_packed, _, _ = _make_int4_data(M, K, N)
+        fp16_bytes = W.nelement() * W.element_size()
+        int4_bytes = W_packed.nelement() * W_packed.element_size()
+        assert int4_bytes == fp16_bytes // 4
+
+
+# ── int4 matmul ─────────────────────────────────────────────────
+
+
+class TestInt4Matmul:
+    """Matmul correctness — PyTorch reference and Triton kernel."""
+
+    @pytest.mark.parametrize("M,K,N", INT4_SIZES)
+    def test_pytorch_vs_fp16(self, M, K, N):
+        """PyTorch dequantized matmul should approximate full-precision matmul."""
+        group_size = 128
+        x, W, W_packed, scales, zeros = _make_int4_data(M, K, N, group_size)
+        ref = matmul_fp16(x, W).float()
+        out = matmul_int4_pytorch(x, W_packed, scales, zeros, group_size)
+        # int4 has 16x fewer bins than int8, so larger matmul error
+        mean_err = (out - ref).abs().mean().item()
+        assert mean_err < 1.5, f"mean matmul error {mean_err:.4f} exceeds 1.5"
+
+    @pytest.mark.parametrize("M,K,N", INT4_SIZES)
+    def test_triton_vs_pytorch(self, M, K, N):
+        """Triton should match PyTorch exactly (same math, different execution)."""
+        group_size = 128
+        x, _, W_packed, scales, zeros = _make_int4_data(M, K, N, group_size)
+        ref = matmul_int4_pytorch(x, W_packed, scales, zeros, group_size)
+        out = matmul_int4_triton(x, W_packed, scales, zeros, group_size)
+        torch.testing.assert_close(out.float(), ref, atol=1.0, rtol=0.1)
+
+    @pytest.mark.parametrize("M,K,N", INT4_SIZES)
+    def test_output_shape(self, M, K, N):
+        group_size = 128
+        x, _, W_packed, scales, zeros = _make_int4_data(M, K, N, group_size)
+        out = matmul_int4_triton(x, W_packed, scales, zeros, group_size)
+        assert out.shape == (M, N)
