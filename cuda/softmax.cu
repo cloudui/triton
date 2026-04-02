@@ -34,9 +34,11 @@ __global__ void softmax_kernel(const half *__restrict__ input,
   // Shared memory for reductions (equivalent to tl.max / tl.sum in Triton)
   extern __shared__ float shared[];
 
+  int nvec = N / 8;
+
   // Pointer to this row's data
-  const half *row_in = input + row * N;
-  half *row_out = output + row * N;
+  const float4 *row_in_vec = reinterpret_cast<const float4 *>(input + row * N);
+  float4 *row_out_vec = reinterpret_cast<float4 *>(output + row * N);
 
   // ========================================================
   // Step 1: Find row max (for numerical stability)
@@ -44,8 +46,14 @@ __global__ void softmax_kernel(const half *__restrict__ input,
   // In CUDA: each thread finds max of its elements, then reduce
   // ========================================================
   float thread_max = -INFINITY;
-  for (int i = tid; i < N; i += blockDim.x) {
-    thread_max = fmaxf(thread_max, __half2float(row_in[i]));
+  for (int i = tid; i < nvec; i += blockDim.x) {
+    float4 chunk = row_in_vec[i];
+    half2 *h = reinterpret_cast<half2 *>(&chunk);
+#pragma unroll
+    for (int j = 0; j < 4; j++) {
+      float2 f = __half22float2(h[j]);
+      thread_max = fmaxf(thread_max, fmaxf(f.x, f.y));
+    }
   }
 
   // Store each thread's max to shared memory
@@ -68,8 +76,14 @@ __global__ void softmax_kernel(const half *__restrict__ input,
   // In CUDA: same loop + reduction pattern
   // ========================================================
   float thread_sum = 0.0f;
-  for (int i = tid; i < N; i += blockDim.x) {
-    thread_sum += expf(__half2float(row_in[i]) - row_max);
+  for (int i = tid; i < nvec; i += blockDim.x) {
+    float4 chunk = row_in_vec[i];
+    half2 *v = reinterpret_cast<half2 *>(&chunk);
+#pragma unroll
+    for (int j = 0; j < 4; j++) {
+      float2 f = __half22float2(v[j]);
+      thread_sum += expf(f.x - row_max) + expf(f.y - row_max);
+    }
   }
 
   shared[tid] = thread_sum;
@@ -89,9 +103,19 @@ __global__ void softmax_kernel(const half *__restrict__ input,
   // In Triton: output = x_exp / sum, tl.store(...)
   // In CUDA: each thread writes its elements
   // ========================================================
-  for (int i = tid; i < N; i += blockDim.x) {
-    float val = expf(__half2float(row_in[i]) - row_max) / row_sum;
-    row_out[i] = __float2half(val);
+  for (int i = tid; i < nvec; i += blockDim.x) {
+    float4 chunk = row_in_vec[i];
+    float4 out_chunk;
+    half2 *v = reinterpret_cast<half2 *>(&chunk);
+    half2 *v_out = reinterpret_cast<half2 *>(&out_chunk);
+#pragma unroll
+    for (int j = 0; j < 4; j++) {
+      float2 f = __half22float2(v[j]);
+      f.x = expf(f.x - row_max) / row_sum;
+      f.y = expf(f.y - row_max) / row_sum;
+      v_out[j] = __float22half2_rn(f);
+    }
+    row_out_vec[i] = out_chunk;
   }
 }
 
