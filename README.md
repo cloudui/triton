@@ -22,6 +22,9 @@ Single-head scaled dot-product attention: `softmax(Q @ K^T / sqrt(d_k)) @ V`. Al
 ### FlashAttention-2 (Full)
 Batched multi-head FlashAttention-2 with optional causal masking. Tiled attention with online softmax, `tl.dot` for tensor core acceleration, causal early exit optimization, and `exp2` hardware intrinsics. O(N) memory instead of O(N²). **Achieves 84-115% of PyTorch's production FlashAttention (Tri Dao's CUDA implementation) on A100.**
 
+### Tiled fp16 Matmul
+Triton tiled matmul using the same 2D grid + K-loop accumulation pattern as the quantized kernels, but with no dequantization. Serves as a baseline to isolate how much of the quantized kernel slowdown is due to dequant overhead vs cuBLAS being more optimized (software pipelining, L2 swizzling, warp specialization, etc.). **~0.74-1.03x of cuBLAS.**
+
 ### Quantized Matmul (int8 / int4)
 Tiled matmul kernels that load quantized weights (int8 or int4) and dequantize on the fly to fp16 for tensor core computation. Int4 kernel handles bit-packed weights (two values per byte) with group-wise scale/zero_point. **2x / 3.8x weight memory savings.** Demonstrates the tiled matmul programming pattern (2D grid + K-loop accumulation) and quantization fundamentals.
 
@@ -109,16 +112,28 @@ Native uses PyTorch's built-in `scaled_dot_product_attention` (Tri Dao's product
 
 ### Quantized Matmul (M=128)
 ```
-K×N            fp16 (ms)    int8 TT (ms)   int4 TT (ms)   int8 vs fp16   int4 vs fp16   int8 mem    int4 mem
---------------------------------------------------------------------------------------------------------------
-1024×1024      0.014        0.019          0.029          0.73x          0.48x          2.0x less   3.8x less
-2048×2048      0.019        0.031          0.053          0.63x          0.36x          2.0x less   3.8x less
-4096×4096      0.048        0.071          0.104          0.68x          0.47x          2.0x less   3.8x less
-4096×11008     0.111        0.154          0.134          0.72x          0.83x          2.0x less   3.8x less
-8192×8192      0.123        0.195          0.233          0.63x          0.53x          2.0x less   3.8x less
+K×N            cuBLAS (ms)   TT fp16 (ms)   int8 TT (ms)   int4 TT (ms)
+-------------------------------------------------------------------------------------
+1024×1024      0.0129        0.0159         0.0224         0.0299
+2048×2048      0.0194        0.0261         0.0309         0.0542
+4096×4096      0.0480        0.0578         0.0694         0.1054
+4096×11008     0.1116        0.1083         0.1503         0.1366
+8192×8192      0.1230        0.1525         0.1934         0.2380
+
+K×N            TT vs cuBLAS   int8 vs cuBLAS   int4 vs cuBLAS   int8 vs TT fp16   int4 vs TT fp16
+----------------------------------------------------------------------------------------------------
+1024×1024      0.81x          0.57x            0.43x            0.71x             0.53x
+2048×2048      0.74x          0.63x            0.36x            0.84x             0.48x
+4096×4096      0.83x          0.69x            0.46x            0.83x             0.55x
+4096×11008     1.03x          0.74x            0.82x            0.72x             0.79x
+8192×8192      0.81x          0.64x            0.52x            0.79x             0.64x
+
+Weight Memory Savings:  int8 = 2.0x less,  int4 = 3.8x less
 ```
 
-Quantized kernels are slower than cuBLAS fp16 because dequantization happens per-tile in fp16 before `tl.dot`. Production systems use integer tensor core instructions (int8×int8→int32) or FP8 tensor cores (H100+) to avoid this overhead. The value of quantization is memory savings (fitting larger models on fewer GPUs), not latency on individual matmuls.
+The quantized kernels are slower than cuBLAS fp16 for two reasons. First, a naive Triton tiled matmul is already ~0.74-1.03x of cuBLAS, which has deep optimizations (software pipelining, L2 swizzling, warp specialization) that this kernel doesn't use. Second, dequantization adds per-tile overhead (cast + subtract + multiply) inside the K-loop. Comparing int8/int4 against the Triton fp16 baseline (same kernel structure, no dequant) isolates the dequant cost at ~0.71-0.84x / ~0.48-0.79x.
+
+Despite loading less data from HBM (int8 = half, int4 = quarter), the bandwidth savings don't compensate for the dequant compute at these sizes — the kernels aren't purely memory-bandwidth bound. Production systems avoid this tradeoff entirely by using integer tensor core instructions (int8×int8→int32) or FP8 tensor cores (H100+), which compute directly on quantized data without dequantizing. The value of this dequantize-on-the-fly approach is memory savings (fitting larger models on fewer GPUs), not latency.
 
 ## Project Structure
 
@@ -131,7 +146,7 @@ kernels/
   flash_attention.py          # FlashAttention-2: single-head, tiled with online softmax
   flash_attention_full.py     # FlashAttention-2: batched, multi-head, causal
   fused_rmsnorm_swiglu.py     # Fused RMSNorm + SwiGLU into one kernel
-  quantized_matmul.py         # int8/int4 quantized matmul with dequantize-on-the-fly
+  quantized_matmul.py         # fp16/int8/int4 tiled matmul with dequantize-on-the-fly
 benchmarks/
   bench_rmsnorm.py            # RMSNorm performance
   bench_swiglu.py             # SwiGLU performance
@@ -176,13 +191,15 @@ This repo represents a progression through Triton kernel development:
 5. **Naive Attention** — 2D block loads. Learn broadcasting and multi-dimensional indexing.
 6. **FlashAttention-2 (single-head)** — Tiled attention with online softmax. Learn looping within kernels and incremental algorithms.
 7. **FlashAttention-2 (full)** — Batched multi-head with causal masking. Learn 2D grids, stride-based pointer arithmetic, tensor core utilization via `tl.dot`, and causal early exit.
-8. **Quantized Matmul** — int8/int4 dequantize-on-the-fly. Learn tiled matmul (2D grid + K-loop), bit packing/unpacking, group quantization, and the tradeoffs between memory savings and compute overhead.
+8. **Tiled fp16 Matmul** — Bare tiled matmul as a cuBLAS comparison baseline. Learn the 2D grid + K-loop accumulation pattern.
+9. **Quantized Matmul** — int8/int4 dequantize-on-the-fly. Learn bit packing/unpacking, group quantization, and the tradeoffs between memory savings and compute overhead.
 
 ## Testing Quantized Matmul
 
 The quantization tests are split into four classes, separating concerns so failures are isolated:
 
 - **`TestInt8Quantization` / `TestInt4Quantization`** — test the quantize/dequantize utilities with no Triton dependency. If the kernel crashes, these still run.
+- **`TestFp16Matmul`** — test Triton tiled fp16 matmul against cuBLAS (`x @ W`).
 - **`TestInt8Matmul` / `TestInt4Matmul`** — test matmul correctness (PyTorch reference vs fp16 baseline, Triton vs PyTorch reference).
 
 All tests are parametrized over multiple matrix sizes to catch dimension-dependent bugs.
