@@ -483,3 +483,39 @@ class TestInt4Matmul:
         x, _, W_packed, scales, zeros = _make_int4_data(M, K, N, group_size)
         out = matmul_int4_triton(x, W_packed, scales, zeros, group_size)
         assert out.shape == (M, N)
+
+
+# ── CUDA kernels ─────────────────────────────────────────────────
+
+
+@pytest.mark.skipif(
+    cuda_kernels is None, reason="CUDA extension not built — run `make build-cuda`"
+)
+class TestCUDASoftmax:
+    def setup_method(self):
+        torch.manual_seed(42)
+        self.x = torch.randn(32, 128, device="cuda", dtype=torch.float16)
+
+    def test_cuda_softmax_shape(self):
+        out = cuda_kernels.softmax(self.x)
+        assert out.shape == self.x.shape
+
+    def test_cuda_softmax_sums_to_one(self):
+        out = cuda_kernels.softmax(self.x)
+        row_sums = out.sum(dim=-1)
+        torch.testing.assert_close(
+            row_sums,
+            torch.ones(32, device="cuda", dtype=torch.float16),
+            atol=1e-2,
+            rtol=1e-2,
+        )
+
+    def test_cuda_matches_pytorch(self):
+        ref = torch.softmax(self.x.float(), dim=-1).half()
+        out = cuda_kernels.softmax(self.x)
+        torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+
+    def test_cuda_matches_triton(self):
+        ref = softmax_triton(self.x)
+        out = cuda_kernels.softmax(self.x)
+        torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
