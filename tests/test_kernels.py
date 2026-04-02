@@ -9,6 +9,11 @@ import sys
 import torch
 
 sys.path.insert(0, ".")
+
+try:
+    import cuda_kernels
+except ImportError:
+    cuda_kernels = None
 from kernels.attention import attention_native, attention_pytorch, attention_triton
 from kernels.flash_attention import (
     flash_attention_naive,
@@ -20,13 +25,21 @@ from kernels.flash_attention_full import (
     flash_attention_full_native,
     flash_attention_full_triton,
 )
+from kernels.quantized_matmul import (
+    dequantize_int4,
+    dequantize_int8,
+    matmul_fp16,
+    matmul_fp16_triton,
+    matmul_int4_pytorch,
+    matmul_int4_triton,
+    matmul_int8_pytorch,
+    matmul_int8_triton,
+    quantize_int4,
+    quantize_int8,
+)
 from kernels.rmsnorm import rmsnorm_native, rmsnorm_pytorch, rmsnorm_triton
 from kernels.softmax import softmax_native, softmax_pytorch, softmax_triton
 from kernels.swiglu import swiglu_native, swiglu_pytorch, swiglu_triton
-from kernels.quantized_matmul import (
-    quantize_int8, dequantize_int8, matmul_fp16, matmul_int8_pytorch, matmul_int8_triton,
-    quantize_int4, dequantize_int4, matmul_int4_pytorch, matmul_int4_triton,
-)
 
 
 class TestRMSNorm:
@@ -186,9 +199,30 @@ class TestFlashAttentionFull:
         self.n_heads = 4
         self.seq_len = 256
         self.d_k = 64
-        self.Q = torch.randn(self.batch, self.n_heads, self.seq_len, self.d_k, device="cuda", dtype=torch.float16)
-        self.K = torch.randn(self.batch, self.n_heads, self.seq_len, self.d_k, device="cuda", dtype=torch.float16)
-        self.V = torch.randn(self.batch, self.n_heads, self.seq_len, self.d_k, device="cuda", dtype=torch.float16)
+        self.Q = torch.randn(
+            self.batch,
+            self.n_heads,
+            self.seq_len,
+            self.d_k,
+            device="cuda",
+            dtype=torch.float16,
+        )
+        self.K = torch.randn(
+            self.batch,
+            self.n_heads,
+            self.seq_len,
+            self.d_k,
+            device="cuda",
+            dtype=torch.float16,
+        )
+        self.V = torch.randn(
+            self.batch,
+            self.n_heads,
+            self.seq_len,
+            self.d_k,
+            device="cuda",
+            dtype=torch.float16,
+        )
 
     def test_non_causal_matches_naive(self):
         ref = flash_attention_full_naive(self.Q, self.K, self.V, causal=False)
@@ -246,6 +280,40 @@ def _make_int4_data(M, K, N, group_size=128):
     W = torch.randn(K, N, device="cuda", dtype=torch.float16)
     W_packed, scales, zeros = quantize_int4(W, group_size)
     return x, W, W_packed, scales, zeros
+
+
+# ── fp16 Triton matmul ─────────────────────────────────────────
+
+FP16_SIZES = [(64, 64, 64), (128, 256, 512), (256, 128, 128)]
+
+
+class TestFp16Matmul:
+    """Triton tiled fp16 matmul vs cuBLAS (x @ W)."""
+
+    @pytest.mark.parametrize("M,K,N", FP16_SIZES)
+    def test_triton_vs_cublas(self, M, K, N):
+        torch.manual_seed(42)
+        x = torch.randn(M, K, device="cuda", dtype=torch.float16)
+        W = torch.randn(K, N, device="cuda", dtype=torch.float16)
+        ref = matmul_fp16(x, W)
+        out = matmul_fp16_triton(x, W)
+        torch.testing.assert_close(out, ref, atol=1e-1, rtol=1e-2)
+
+    @pytest.mark.parametrize("M,K,N", FP16_SIZES)
+    def test_output_shape(self, M, K, N):
+        torch.manual_seed(42)
+        x = torch.randn(M, K, device="cuda", dtype=torch.float16)
+        W = torch.randn(K, N, device="cuda", dtype=torch.float16)
+        out = matmul_fp16_triton(x, W)
+        assert out.shape == (M, N)
+
+    @pytest.mark.parametrize("M,K,N", FP16_SIZES)
+    def test_output_dtype(self, M, K, N):
+        torch.manual_seed(42)
+        x = torch.randn(M, K, device="cuda", dtype=torch.float16)
+        W = torch.randn(K, N, device="cuda", dtype=torch.float16)
+        out = matmul_fp16_triton(x, W)
+        assert out.dtype == torch.float16
 
 
 # ── int8 quantization ──────────────────────────────────────────
