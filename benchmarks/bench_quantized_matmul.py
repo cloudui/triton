@@ -14,8 +14,14 @@ from triton.testing import do_bench
 
 sys.path.insert(0, ".")
 from kernels.quantized_matmul import (
-    quantize_int8, matmul_fp16, matmul_int8_pytorch, matmul_int8_triton,
-    quantize_int4, matmul_int4_pytorch, matmul_int4_triton,
+    matmul_fp16,
+    matmul_fp16_triton,
+    matmul_int4_pytorch,
+    matmul_int4_triton,
+    matmul_int8_pytorch,
+    matmul_int8_triton,
+    quantize_int4,
+    quantize_int8,
 )
 
 
@@ -43,15 +49,17 @@ def benchmark_latency():
     ]
     group_size = 128
 
-    print(f"\n{'=' * 110}")
-    print(f"  Latency Benchmark  (M={M}, batch of tokens × weight matrix)")
-    print(f"{'=' * 110}")
+    # --- Latency table ---
+    print(f"\n{'=' * 85}")
+    print(f"  Latency  (M={M})")
+    print(f"{'=' * 85}")
     print(
-        f"{'K×N':<14} {'fp16 (ms)':<12} {'int8 PT (ms)':<14} {'int8 TT (ms)':<14} "
-        f"{'int4 PT (ms)':<14} {'int4 TT (ms)':<14} {'int8 TT vs fp16':<16} {'int4 TT vs fp16'}"
+        f"{'K×N':<14} {'cuBLAS (ms)':<13} {'TT fp16 (ms)':<14} "
+        f"{'int8 TT (ms)':<14} {'int4 TT (ms)':<14}"
     )
-    print("-" * 110)
+    print("-" * 85)
 
+    rows = []
     for K, N in sizes:
         x = torch.randn(M, K, device="cuda", dtype=torch.float16)
         W = torch.randn(K, N, device="cuda", dtype=torch.float16)
@@ -59,31 +67,55 @@ def benchmark_latency():
         W_int8, scale8, zp8 = quantize_int8(W)
         W_packed, scales4, zeros4 = quantize_int4(W, group_size)
 
-        ms_fp16 = do_bench(lambda: matmul_fp16(x, W))
-        ms_int8_pt = do_bench(lambda: matmul_int8_pytorch(x, W_int8, scale8, zp8))
+        ms_cublas = do_bench(lambda: matmul_fp16(x, W))
+
+        try:
+            ms_fp16_tt = do_bench(lambda: matmul_fp16_triton(x, W))
+        except Exception:
+            ms_fp16_tt = None
 
         try:
             ms_int8_tt = do_bench(lambda: matmul_int8_triton(x, W_int8, scale8, zp8))
-            int8_tt_str = fmt_ms(ms_int8_tt)
-            vs_fp16_int8 = fmt_speedup(ms_fp16, ms_int8_tt)
         except Exception:
-            int8_tt_str = "FAIL"
-            vs_fp16_int8 = "-"
-
-        ms_int4_pt = do_bench(lambda: matmul_int4_pytorch(x, W_packed, scales4, zeros4, group_size))
+            ms_int8_tt = None
 
         try:
-            ms_int4_tt = do_bench(lambda: matmul_int4_triton(x, W_packed, scales4, zeros4, group_size))
-            int4_tt_str = fmt_ms(ms_int4_tt)
-            vs_fp16_int4 = fmt_speedup(ms_fp16, ms_int4_tt)
+            ms_int4_tt = do_bench(
+                lambda: matmul_int4_triton(x, W_packed, scales4, zeros4, group_size)
+            )
         except Exception:
-            int4_tt_str = "FAIL"
-            vs_fp16_int4 = "-"
+            ms_int4_tt = None
+
+        rows.append((K, N, ms_cublas, ms_fp16_tt, ms_int8_tt, ms_int4_tt))
 
         size_label = f"{K}×{N}"
         print(
-            f"{size_label:<14} {fmt_ms(ms_fp16):<12} {fmt_ms(ms_int8_pt):<14} {int8_tt_str:<14} "
-            f"{fmt_ms(ms_int4_pt):<14} {int4_tt_str:<14} {vs_fp16_int8:<16} {vs_fp16_int4}"
+            f"{size_label:<14} {fmt_ms(ms_cublas):<13} "
+            f"{fmt_ms(ms_fp16_tt) if ms_fp16_tt else 'FAIL':<14} "
+            f"{fmt_ms(ms_int8_tt) if ms_int8_tt else 'FAIL':<14} "
+            f"{fmt_ms(ms_int4_tt) if ms_int4_tt else 'FAIL':<14}"
+        )
+
+    # --- Speedup table ---
+    print(f"\n{'=' * 100}")
+    print(f"  Speedups")
+    print(f"{'=' * 100}")
+    print(
+        f"{'K×N':<14} {'TT vs cuBLAS':<14} "
+        f"{'int8 vs cuBLAS':<16} {'int4 vs cuBLAS':<16} "
+        f"{'int8 vs TT fp16':<17} {'int4 vs TT fp16'}"
+    )
+    print("-" * 100)
+
+    for K, N, ms_cublas, ms_fp16_tt, ms_int8_tt, ms_int4_tt in rows:
+        size_label = f"{K}×{N}"
+        print(
+            f"{size_label:<14} "
+            f"{fmt_speedup(ms_cublas, ms_fp16_tt) if ms_fp16_tt else '-':<14} "
+            f"{fmt_speedup(ms_cublas, ms_int8_tt) if ms_int8_tt else '-':<16} "
+            f"{fmt_speedup(ms_cublas, ms_int4_tt) if ms_int4_tt else '-':<16} "
+            f"{fmt_speedup(ms_fp16_tt, ms_int8_tt) if ms_fp16_tt and ms_int8_tt else '-':<17} "
+            f"{fmt_speedup(ms_fp16_tt, ms_int4_tt) if ms_fp16_tt and ms_int4_tt else '-'}"
         )
 
 
@@ -111,9 +143,13 @@ def benchmark_memory():
 
         fp16_mb = weight_bytes(W) / 1e6
         # int8: weights + scale + zero_point
-        int8_mb = (weight_bytes(W_int8) + weight_bytes(scale8) + weight_bytes(zp8)) / 1e6
+        int8_mb = (
+            weight_bytes(W_int8) + weight_bytes(scale8) + weight_bytes(zp8)
+        ) / 1e6
         # int4: packed weights + scales + zeros
-        int4_mb = (weight_bytes(W_packed) + weight_bytes(scales4) + weight_bytes(zeros4)) / 1e6
+        int4_mb = (
+            weight_bytes(W_packed) + weight_bytes(scales4) + weight_bytes(zeros4)
+        ) / 1e6
 
         print(
             f"{K}×{N:<8} {fp16_mb:<12.2f} {int8_mb:<12.2f} {int4_mb:<12.2f} "

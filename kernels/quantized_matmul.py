@@ -160,6 +160,99 @@ def matmul_int4_pytorch(
 # ============================================================
 # Triton kernels
 # ============================================================
+@triton.jit
+def matmul_fp16_kernel(
+    X,
+    W,
+    Output,
+    M,
+    N,
+    K,
+    stride_xm,
+    stride_xk,
+    stride_wk,
+    stride_wn,
+    stride_om,
+    stride_on,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    pid_m = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
+
+    offsets_m = tl.arange(0, BLOCK_M)
+    offsets_k = tl.arange(0, BLOCK_K)
+    offsets_n = tl.arange(0, BLOCK_N)
+
+    offsets_row_x = pid_m * BLOCK_M + offsets_m
+    mask_row_x = offsets_row_x < M
+
+    offsets_col_w = pid_n * BLOCK_N + offsets_n
+    mask_col_w = offsets_col_w < N
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for start in tl.range(0, K, BLOCK_K):
+        offsets_k_i = start + offsets_k
+        mask_k_i = offsets_k_i < K
+
+        offsets_x_i = (
+            offsets_row_x[:, None] * stride_xm + offsets_k_i[None, :] * stride_xk
+        )
+        mask_x_i = mask_row_x[:, None] & mask_k_i[None, :]
+        x = tl.load(X + offsets_x_i, mask_x_i)
+
+        offsets_w_i = (
+            offsets_k_i[:, None] * stride_wk + offsets_col_w[None, :] * stride_wn
+        )
+        mask_w_i = mask_k_i[:, None] & mask_col_w[None, :]
+
+        w = tl.load(W + offsets_w_i, mask_w_i)
+
+        acc = tl.dot(x, w, acc)
+
+    offsets_row_o = pid_m * BLOCK_M + offsets_m
+    offsets_col_o = pid_n * BLOCK_N + offsets_n
+    mask_row_o = offsets_row_o < M
+    mask_col_o = offsets_col_o < N
+    offsets_o = offsets_row_o[:, None] * stride_om + offsets_col_o[None, :] * stride_on
+    mask_o = mask_row_o[:, None] & mask_col_o[None, :]
+
+    tl.store(Output + offsets_o, acc.to(tl.float16), mask_o)
+
+
+def matmul_fp16_triton(x: torch.Tensor, W: torch.Tensor) -> torch.Tensor:
+    M, K = x.shape
+    N = W.shape[-1]
+    output = torch.empty((M, N), device=x.device, dtype=torch.float16)
+
+    stride_xm, stride_xk = x.stride()
+    stride_wk, stride_wn = W.stride()
+    stride_om, stride_on = output.stride()
+
+    BLOCK_M, BLOCK_K, BLOCK_N = 64, 64, 64
+    grid = (M // BLOCK_M, N // BLOCK_N)
+
+    matmul_fp16_kernel[grid](
+        x,
+        W,
+        output,
+        M,
+        N,
+        K,
+        stride_xm,
+        stride_xk,
+        stride_wk,
+        stride_wn,
+        stride_om,
+        stride_on,
+        BLOCK_M,
+        BLOCK_N,
+        BLOCK_K,
+    )
+
+    return output
 
 
 @triton.jit
@@ -236,7 +329,7 @@ def matmul_int8_triton(
 ) -> torch.Tensor:
     M, K = x.shape
     N = W_int8.shape[-1]
-    output = torch.empty((M, N), device=x.device)
+    output = torch.empty((M, N), device=x.device, dtype=torch.float16)
 
     stride_xm, stride_xk = x.stride()
     stride_wk, stride_wn = W_int8.stride()
@@ -362,7 +455,7 @@ def matmul_int4_triton(
 ) -> torch.Tensor:
     M, K = x.shape
     N = W_packed.shape[-1] * 2
-    output = torch.empty((M, N), device=x.device)
+    output = torch.empty((M, N), device=x.device, dtype=torch.float16)
 
     stride_xm, stride_xk = x.stride()
     stride_wk, stride_wn = W_packed.stride()
