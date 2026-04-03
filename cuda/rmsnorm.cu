@@ -80,26 +80,20 @@ __global__ void rmsnorm_kernel(const half *__restrict__ input,
   }
 }
 
+// TODO: implement actual rmsnorm kernel
 // PyTorch binding — makes it callable from Python
-torch::Tensor softmax_cuda(torch::Tensor input) {
+torch::Tensor rmsnorm_cuda(torch::Tensor input) {
   auto output = torch::empty_like(input);
   int M = input.size(0);
   int N = input.size(1);
 
-  // Launch config: one block per row, 256 threads per block
-  // In Triton: grid = (M,), block size is implicit
   int threads = 256;
   int blocks = M;
   int shared_mem = threads * sizeof(float);
 
-  softmax_kernel<<<blocks, threads, shared_mem>>>(
+  rmsnorm_kernel<<<blocks, threads, shared_mem>>>(
       reinterpret_cast<const half *>(input.data_ptr<at::Half>()),
       reinterpret_cast<half *>(output.data_ptr<at::Half>()), N);
 
   return output;
-}
-
-// Register as a PyTorch extension
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("softmax", &softmax_cuda, "Softmax (CUDA)");
 }
