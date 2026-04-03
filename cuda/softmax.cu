@@ -1,5 +1,5 @@
 /*
- * Softmax CUDA kernel — starting point for learning raw CUDA.
+ * Softmax CUDA kernel — Barebones NAIVE implementation of CUDA Softmax
  *
  * Compare to kernels/softmax.py to see what Triton abstracts away.
  *
@@ -137,4 +137,3 @@ torch::Tensor softmax_cuda(torch::Tensor input) {
 
   return output;
 }
-
