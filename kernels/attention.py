@@ -93,8 +93,8 @@ def attention_triton(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor) -> torch
         stride_k=stride,
         stride_v=stride,
         stride_o=stride,
-        BLOCK_SEQ=64,  # hardcoded for basic test case
-        BLOCK_DK=64,
+        BLOCK_SEQ=triton.next_power_of_2(seq_len),
+        BLOCK_DK=triton.next_power_of_2(stride),
     )
 
     return output

@@ -45,8 +45,8 @@ from kernels.swiglu import swiglu_native, swiglu_pytorch, swiglu_triton
 class TestRMSNorm:
     def setup_method(self):
         torch.manual_seed(42)
-        self.x = torch.randn(32, 128, device="cuda", dtype=torch.float16)
-        self.weight = torch.randn(128, device="cuda", dtype=torch.float16)
+        self.x = torch.randn(32, 2048, device="cuda", dtype=torch.float16)
+        self.weight = torch.randn(2048, device="cuda", dtype=torch.float16)
 
     def test_pytorch_rmsnorm_shape(self):
         out = rmsnorm_pytorch(self.x, self.weight)
@@ -70,8 +70,8 @@ class TestRMSNorm:
 class TestSwiGLU:
     def setup_method(self):
         torch.manual_seed(42)
-        self.x = torch.randn(32, 128, device="cuda", dtype=torch.float16)
-        self.gate = torch.randn(32, 128, device="cuda", dtype=torch.float16)
+        self.x = torch.randn(32, 2048, device="cuda", dtype=torch.float16)
+        self.gate = torch.randn(32, 2048, device="cuda", dtype=torch.float16)
 
     def test_pytorch_swiglu_shape(self):
         out = swiglu_pytorch(self.x, self.gate)
@@ -91,9 +91,9 @@ class TestSwiGLU:
 class TestFused:
     def setup_method(self):
         torch.manual_seed(42)
-        self.x = torch.randn(32, 128, device="cuda", dtype=torch.float16)
-        self.gate = torch.randn(32, 128, device="cuda", dtype=torch.float16)
-        self.weight = torch.randn(128, device="cuda", dtype=torch.float16)
+        self.x = torch.randn(32, 2048, device="cuda", dtype=torch.float16)
+        self.gate = torch.randn(32, 2048, device="cuda", dtype=torch.float16)
+        self.weight = torch.randn(2048, device="cuda", dtype=torch.float16)
 
     def test_fused_matches_separate(self):
         from kernels.fused_rmsnorm_swiglu import fused_rmsnorm_swiglu_triton
@@ -107,7 +107,7 @@ class TestFused:
 class TestSoftmax:
     def setup_method(self):
         torch.manual_seed(42)
-        self.x = torch.randn(32, 128, device="cuda", dtype=torch.float16)
+        self.x = torch.randn(32, 2048, device="cuda", dtype=torch.float16)
 
     def test_pytorch_softmax_shape(self):
         out = softmax_pytorch(self.x)
@@ -137,7 +137,7 @@ class TestSoftmax:
 class TestAttention:
     def setup_method(self):
         torch.manual_seed(42)
-        self.seq_len = 64
+        self.seq_len = 256
         self.d_k = 64
         self.Q = torch.randn(self.seq_len, self.d_k, device="cuda", dtype=torch.float16)
         self.K = torch.randn(self.seq_len, self.d_k, device="cuda", dtype=torch.float16)
@@ -518,4 +518,45 @@ class TestCUDASoftmax:
     def test_cuda_matches_triton(self):
         ref = softmax_triton(self.x)
         out = cuda_kernels.softmax(self.x)
+        torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.skipif(
+    cuda_kernels is None, reason="CUDA extension not built — run `make build-cuda`"
+)
+class TestCUDASoftmaxTriton:
+    """Vectorized CUDA softmax (Triton-style single-pass caching)."""
+
+    def setup_method(self):
+        torch.manual_seed(42)
+        self.x = torch.randn(32, 128, device="cuda", dtype=torch.float16)
+
+    def test_shape(self):
+        out = cuda_kernels.softmax_triton(self.x)
+        assert out.shape == self.x.shape
+
+    def test_sums_to_one(self):
+        out = cuda_kernels.softmax_triton(self.x)
+        row_sums = out.sum(dim=-1)
+        torch.testing.assert_close(
+            row_sums,
+            torch.ones(32, device="cuda", dtype=torch.float16),
+            atol=1e-2,
+            rtol=1e-2,
+        )
+
+    def test_matches_pytorch(self):
+        ref = torch.softmax(self.x.float(), dim=-1).half()
+        out = cuda_kernels.softmax_triton(self.x)
+        torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+
+    def test_matches_cuda_softmax(self):
+        ref = cuda_kernels.softmax(self.x)
+        out = cuda_kernels.softmax_triton(self.x)
+        torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+
+    def test_large_input(self):
+        x = torch.randn(32, 8192, device="cuda", dtype=torch.float16)
+        ref = torch.softmax(x.float(), dim=-1).half()
+        out = cuda_kernels.softmax_triton(x)
         torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)

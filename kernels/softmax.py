@@ -48,7 +48,7 @@ def softmax_kernel(
 def softmax_triton(x: torch.Tensor) -> torch.Tensor:
     stride = x.shape[-1]
     N = x.shape[-1]
-    BLOCK_SIZE = 1024
+    BLOCK_SIZE = triton.next_power_of_2(N)
 
     output = torch.empty_like(x)
 

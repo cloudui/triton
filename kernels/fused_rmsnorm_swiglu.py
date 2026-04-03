@@ -48,7 +48,7 @@ def fused_rmsnorm_swiglu_triton(
     stride = x.shape[-1]
     output = torch.empty_like(x)
 
-    BLOCK_SIZE = 1024
+    BLOCK_SIZE = triton.next_power_of_2(N)
 
     grid = (x.shape[0],)
     fused_rmsnorm_swiglu_kernel[grid](
