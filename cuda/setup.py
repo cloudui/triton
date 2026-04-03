@@ -6,7 +6,7 @@ setup(
     ext_modules=[
         CUDAExtension(
             "cuda_kernels",
-            ["softmax.cu"],
+            ["bindings.cu", "softmax.cu", "softmax_triton.cu", "rmsnorm.cu"],
             extra_compile_args={"nvcc": ["-ccbin", "/usr/bin/gcc"]},
         ),
     ],

@@ -138,7 +138,3 @@ torch::Tensor softmax_cuda(torch::Tensor input) {
   return output;
 }
 
-// Register as a PyTorch extension
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("softmax", &softmax_cuda, "Softmax (CUDA)");
-}
