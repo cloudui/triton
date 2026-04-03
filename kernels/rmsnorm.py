@@ -44,7 +44,7 @@ def rmsnorm_kernel(
     x = tl.load(X + offsets, mask=mask)
     weight = tl.load(Weight + col_offsets, mask=mask)
 
-    rms = tl.sqrt(tl.sum(x * x) / stride + eps)
+    rms = tl.sqrt(tl.sum(x * x) / N + eps)
     output = x / rms * weight
 
     tl.store(Output + offsets, output, mask=mask)
@@ -54,7 +54,7 @@ def rmsnorm_triton(
     x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6
 ) -> torch.Tensor:
     N = x.shape[-1]
-    stride = x.shape[-1]
+    stride = x.stride()[0]
     output = torch.empty_like(x)
 
     BLOCK_SIZE = triton.next_power_of_2(N)
