@@ -5,19 +5,19 @@ Custom Triton kernels for core transformer operations — from elementwise activ
 ## Kernels
 
 ### RMSNorm
-Row-wise normalization used in Llama, Mistral, etc. Each Triton program handles one row — loads the full row, computes `sqrt(mean(x^2) + eps)`, normalizes, and scales by a learned weight. **4.5-6.4x faster than PyTorch.**
+Row-wise normalization used in Llama, Mistral, etc. Each Triton program handles one row — loads the full row, computes `sqrt(mean(x^2) + eps)`, normalizes, and scales by a learned weight. **3.3-4.9x faster than PyTorch.**
 
 ### SwiGLU
 Gated activation: `SwiGLU(x, gate) = x * silu(gate)`. Elementwise operation — each Triton program processes a flat block of elements. **1.5-2.3x faster than PyTorch.**
 
 ### Fused RMSNorm + SwiGLU
-Combines normalization and activation into a single kernel to avoid an extra round trip to HBM. In a standard transformer FFN, these run back-to-back, so fusing them halves global memory accesses. **5-6x faster than PyTorch, 3-4x faster than torch.compile.**
+Combines normalization and activation into a single kernel to avoid an extra round trip to HBM. In a standard transformer FFN, these run back-to-back, so fusing them halves global memory accesses. **3-6x faster than PyTorch, 1.3-6x faster than torch.compile.**
 
 ### Softmax
-Numerically stable softmax with row-wise max subtraction for fp16 precision. **4-9x faster than PyTorch, 1.2-1.8x faster than native.**
+Numerically stable softmax with row-wise max subtraction for fp16 precision. **3.5-8x faster than PyTorch, 1.0-1.8x faster than native.**
 
 ### Naive Attention
-Single-head scaled dot-product attention: `softmax(Q @ K^T / sqrt(d_k)) @ V`. All three operations fused into one kernel. Only works for short sequences (must fit in one block). **1.9-2.3x faster than PyTorch, 1.2-1.6x faster than native.**
+Single-head scaled dot-product attention: `softmax(Q @ K^T / sqrt(d_k)) @ V`. All three operations fused into one kernel. Block size scales with sequence length, but performance degrades at longer sequences since the entire attention row must fit in one block. **1.0-2.5x faster than PyTorch at short sequences.** FlashAttention removes this limitation via tiling.
 
 ### FlashAttention-2 (Full)
 Batched multi-head FlashAttention-2 with optional causal masking. Tiled attention with online softmax, `tl.dot` for tensor core acceleration, causal early exit optimization, and `exp2` hardware intrinsics. O(N) memory instead of O(N²). **Achieves 84-115% of PyTorch's production FlashAttention (Tri Dao's CUDA implementation) on A100.**
@@ -28,6 +28,9 @@ Triton tiled matmul using the same 2D grid + K-loop accumulation pattern as the 
 ### Quantized Matmul (int8 / int4)
 Tiled matmul kernels that load quantized weights (int8 or int4) and dequantize on the fly to fp16 for tensor core computation. Int4 kernel handles bit-packed weights (two values per byte) with group-wise scale/zero_point. **2x / 3.8x weight memory savings.** Demonstrates the tiled matmul programming pattern (2D grid + K-loop accumulation) and quantization fundamentals.
 
+### CUDA Softmax
+Hand-written CUDA softmax kernels for comparison with Triton. Two versions: **v1** uses a three-pass approach (max, exp+sum, normalize) with float4 vectorized loads and shared memory tree reductions. **v2** caches values in registers on the first pass (Triton-style single-pass caching), avoiding re-reads from global memory, with templated loop unrolling and a generic `block_reduce` helper. **v2 is 1.0-1.3x faster than v1, competitive with Triton.**
+
 ## Benchmarks
 
 All benchmarks on NVIDIA A100 80GB with fp16.
@@ -36,10 +39,10 @@ All benchmarks on NVIDIA A100 80GB with fp16.
 ```
 Hidden Size     PyTorch (ms)    Native (ms)     Triton (ms)     Speedup
 ----------------------------------------------------------------------
-1024            0.035           0.039           0.009           4.53x
-2048            0.032           0.043           0.008           5.16x
-4096            0.040           0.050           0.008           6.44x
-8192            0.037           0.052           0.008           6.20x
+1024            0.033           0.039           0.007           5.18x
+2048            0.032           0.041           0.007           5.50x
+4096            0.039           0.049           0.008           5.84x
+8192            0.036           0.051           0.011           4.74x
 ```
 
 ### SwiGLU
@@ -54,34 +57,34 @@ n= 8,388,608 | PyTorch: 0.1015ms | Triton: 0.0438ms | Speedup: 2.32x
 ```
 Hidden     PyTorch (ms)    Compiled (ms)    Fused (ms)     Fused vs PyT   Fused vs Comp
 ----------------------------------------------------------------------------------------
-128        0.0376          0.0073           0.0080         4.70           0.91
-512        0.0402          0.0324           0.0081         4.96           3.98
-1024       0.0384          0.0272           0.0079         4.87           3.45
-2048       0.0426          0.0266           0.0085         4.99           3.12
-4096       0.0508          0.0274           0.0081         6.30           3.40
-8192       0.0513          0.0336           0.0081         6.30           4.12
+128        0.0451          0.0097           0.0075         5.98           1.29
+512        0.0396          0.0470           0.0075         5.28           6.26
+1024       0.0417          0.0372           0.0072         5.83           5.21
+2048       0.0425          0.0346           0.0164         2.58           2.10
+4096       0.0498          0.0328           0.0114         4.35           2.86
+8192       0.0519          0.0447           0.0146         3.55           3.06
 ```
 
 ### Softmax (batch=32)
 ```
 Hidden     PyTorch (ms)    Native (ms)     Triton (ms)    vs PyTorch   vs Native
 ---------------------------------------------------------------------------
-128        0.0339          0.0099          0.0075         4.45x       1.30x
-512        0.0313          0.0098          0.0071         4.36x       1.39x
-1024       0.0354          0.0131          0.0071         4.98x       1.83x
-2048       0.0450          0.0089          0.0071         6.30x       1.25x
-4096       0.0630          0.0090          0.0076         8.32x       1.19x
-8192       0.0337          0.0109          0.0077         4.39x       1.42x
+128        0.0275          0.0074          0.0064         4.27x       1.15x
+512        0.0306          0.0092          0.0070         4.40x       1.32x
+1024       0.0353          0.0121          0.0066         5.34x       1.83x
+2048       0.0446          0.0083          0.0072         6.16x       1.15x
+4096       0.0628          0.0088          0.0078         8.09x       1.14x
+8192       0.0336          0.0100          0.0096         3.49x       1.03x
 ```
 
 ### Naive Attention (single-head, d_k=64)
 ```
 Seq Len      PyTorch (ms)    Native (ms)     Triton (ms)    vs PyTorch   vs Native
 --------------------------------------------------------------------------------
-64           0.0215          0.0152          0.0093         2.30x       1.63x
-128          0.0223          0.0121          0.0102         2.18x       1.18x
-256          0.0206          0.0159          0.0109         1.90x       1.46x
-512          0.0254          0.0168          0.0118         2.15x       1.42x
+64           0.0217          0.0151          0.0087         2.49x       1.72x
+128          0.0193          0.0118          0.0113         1.72x       1.05x
+256          0.0202          0.0154          0.0159         1.27x       0.97x
+512          0.0369          0.0162          0.0374         0.99x       0.43x
 ```
 
 ### FlashAttention-2 — Non-Causal (batch=4, heads=8, d_k=64)
@@ -106,6 +109,18 @@ Seq Len    Naive (ms)     Flash (ms)     Native (ms)    Flash vs Naive   Flash v
 1024       0.6240         0.0604         0.0608         10.33x           1.01x
 2048       3.1640         0.1730         0.1555         18.29x           0.90x
 4096       10.3571        0.5845         0.4911         17.72x           0.84x
+```
+
+### CUDA Softmax (batch=32)
+```
+Hidden     PyTorch (ms)    Triton (ms)     CUDA (ms)       CUDA-v2 (ms)    v2 vs Tri    v2 vs v1
+----------------------------------------------------------------------------------------------------
+128        0.0285          0.0066          0.0087          0.0069          0.95x        1.25x
+512        0.0313          0.0066          0.0086          0.0075          0.88x        1.14x
+1024       0.0359          0.0096          0.0081          0.0072          1.34x        1.13x
+2048       0.0454          0.0149          0.0084          0.0081          1.85x        1.04x
+4096       0.0635          0.0084          0.0100          0.0086          0.97x        1.16x
+8192       0.0342          0.0100          0.0130          0.0100          1.00x        1.30x
 ```
 
 Native uses PyTorch's built-in `scaled_dot_product_attention` (Tri Dao's production FlashAttention CUDA implementation). Our Triton implementation achieves 84-115% of production performance at small-to-medium sequence lengths, narrowing to ~84% at seq_len=4096.
@@ -138,6 +153,12 @@ Despite loading less data from HBM (int8 = half, int4 = quarter), the bandwidth 
 ## Project Structure
 
 ```
+cuda/
+  softmax.cu                  # CUDA softmax: vectorized float4, shared memory reductions
+  softmax_triton.cu           # CUDA softmax v2: register caching, templated unrolling
+  reduce.cuh                  # Generic block_reduce helper (max, sum)
+  bindings.cu                 # PyTorch C++ extension bindings
+  setup.py                    # Build script for CUDA extension
 kernels/
   rmsnorm.py                  # RMSNorm: row-wise normalization
   swiglu.py                   # SwiGLU: gated FFN activation
@@ -178,6 +199,10 @@ python benchmarks/bench_flash_attention.py
 python benchmarks/bench_flash_attention_full.py
 python benchmarks/bench_fused.py
 python benchmarks/bench_quantized_matmul.py
+
+# Build and benchmark CUDA kernels
+make build-cuda
+python benchmarks/bench_cuda_softmax.py
 ```
 
 ## Learning Path
