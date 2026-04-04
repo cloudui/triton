@@ -96,7 +96,7 @@ __global__ void softmax_kernel(const half *__restrict__ input,
     }
     __syncthreads();
   }
-  float row_sum = shared[0];
+  float inv_row_sum = 1.0f / shared[0];
 
   // ========================================================
   // Step 3: Normalize and write output
@@ -111,8 +111,8 @@ __global__ void softmax_kernel(const half *__restrict__ input,
 #pragma unroll
     for (int j = 0; j < 4; j++) {
       float2 f = __half22float2(v[j]);
-      f.x = expf(f.x - row_max) / row_sum;
-      f.y = expf(f.y - row_max) / row_sum;
+      f.x = expf(f.x - row_max) * inv_row_sum;
+      f.y = expf(f.y - row_max) * inv_row_sum;
       v_out[j] = __float22half2_rn(f);
     }
     row_out_vec[i] = out_chunk;

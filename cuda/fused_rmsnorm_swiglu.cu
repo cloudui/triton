@@ -63,7 +63,7 @@ __global__ void fused_rmsnorm_swiglu_kernel(const half *__restrict__ input,
 
   float row_sum = block_reduce(thread_square_sum, shared, tid, SumOp{});
   // synced, now calculate rownorm
-  float row_rmsnorm = __fsqrt_rn(row_sum / N + EPS);
+  float inv_rms = __frsqrt_rn(row_sum / N + EPS);
 
 #pragma unroll
   for (int i = 0; i < NUM_ITERS; i++) {
@@ -74,8 +74,8 @@ __global__ void fused_rmsnorm_swiglu_kernel(const half *__restrict__ input,
 #pragma unroll
       for (int j = 0; j < 4; j++) {
         float2 f;
-        f.x = vals[8 * i + 2 * j] / row_rmsnorm;
-        f.y = vals[8 * i + 2 * j + 1] / row_rmsnorm;
+        f.x = vals[8 * i + 2 * j] * inv_rms;
+        f.y = vals[8 * i + 2 * j + 1] * inv_rms;
         v_out[j] = __float22half2_rn(f);
       }
       row_out_vec[ind] = out_chunk;

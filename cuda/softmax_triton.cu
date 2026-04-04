@@ -89,7 +89,7 @@ __global__ void softmax_triton_kernel(const half *__restrict__ input,
     thread_sum += vals[i];
   }
 
-  float row_sum = block_reduce(thread_sum, shared, tid, SumOp{});
+  float inv_row_sum = 1.0f / block_reduce(thread_sum, shared, tid, SumOp{});
 
   // Pass 3: Normalize cached values and write back to global memory.
 #pragma unroll
@@ -101,8 +101,8 @@ __global__ void softmax_triton_kernel(const half *__restrict__ input,
 #pragma unroll
       for (int j = 0; j < 4; j++) {
         float2 f;
-        f.x = vals[8 * i + 2 * j] / row_sum;
-        f.y = vals[8 * i + 2 * j + 1] / row_sum;
+        f.x = vals[8 * i + 2 * j] * inv_row_sum;
+        f.y = vals[8 * i + 2 * j + 1] * inv_row_sum;
         v_out[j] = __float22half2_rn(f);
       }
       row_out_vec[ind] = out_chunk;
