@@ -560,3 +560,40 @@ class TestCUDASoftmaxTriton:
         ref = torch.softmax(x.float(), dim=-1).half()
         out = cuda_kernels.softmax_triton(x)
         torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.skipif(
+    cuda_kernels is None, reason="CUDA extension not built — run `make build-cuda`"
+)
+class TestCUDAFusedRMSNormSwiGLU:
+    def setup_method(self):
+        torch.manual_seed(42)
+        self.x = torch.randn(32, 2048, device="cuda", dtype=torch.float16)
+        self.gate = torch.randn(32, 2048, device="cuda", dtype=torch.float16)
+        self.weight = torch.randn(2048, device="cuda", dtype=torch.float16)
+
+    def test_shape(self):
+        out = cuda_kernels.fused_rmsnorm_swiglu(self.x, self.weight, self.gate)
+        assert out.shape == self.x.shape
+
+    def test_matches_pytorch(self):
+        normed = rmsnorm_pytorch(self.x, self.weight)
+        ref = swiglu_pytorch(normed, self.gate)
+        out = cuda_kernels.fused_rmsnorm_swiglu(self.x, self.weight, self.gate)
+        torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+
+    def test_matches_triton(self):
+        from kernels.fused_rmsnorm_swiglu import fused_rmsnorm_swiglu_triton
+
+        ref = fused_rmsnorm_swiglu_triton(self.x, self.gate, self.weight)
+        out = cuda_kernels.fused_rmsnorm_swiglu(self.x, self.weight, self.gate)
+        torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+
+    def test_large_input(self):
+        x = torch.randn(32, 8192, device="cuda", dtype=torch.float16)
+        gate = torch.randn(32, 8192, device="cuda", dtype=torch.float16)
+        weight = torch.randn(8192, device="cuda", dtype=torch.float16)
+        normed = rmsnorm_pytorch(x, weight)
+        ref = swiglu_pytorch(normed, gate)
+        out = cuda_kernels.fused_rmsnorm_swiglu(x, weight, gate)
+        torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
