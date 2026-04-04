@@ -29,7 +29,7 @@ Triton tiled matmul using the same 2D grid + K-loop accumulation pattern as the 
 Tiled matmul kernels that load quantized weights (int8 or int4) and dequantize on the fly to fp16 for tensor core computation. Int4 kernel handles bit-packed weights (two values per byte) with group-wise scale/zero_point. **2x / 3.8x weight memory savings.** Demonstrates the tiled matmul programming pattern (2D grid + K-loop accumulation) and quantization fundamentals.
 
 ### CUDA Softmax
-Hand-written CUDA softmax kernels for comparison with Triton. Two versions: **v1** uses a three-pass approach (max, exp+sum, normalize) with float4 vectorized loads and shared memory tree reductions. **v2** caches values in registers on the first pass (Triton-style single-pass caching), avoiding re-reads from global memory, with templated loop unrolling and a generic `block_reduce` helper. **v2 is 1.0-1.3x faster than v1, competitive with Triton.**
+Hand-written CUDA softmax kernels for comparison with Triton. Two versions: **v1** uses a three-pass approach (max, exp+sum, normalize) with float4 vectorized loads and shared memory tree reductions. **v2** caches all values in registers on the first pass (Triton-style single-pass caching), so exp/sum/normalize become register-only work with no redundant global memory reads. Uses templated `NUM_ITERS` for compile-time loop unrolling and a generic `block_reduce` helper. Currently supports rows up to N=8192 (256 threads × 8 values/thread × 4 max iterations). **v2 is 1.0-1.3x faster than v1, competitive with Triton.**
 
 ## Benchmarks
 
